@@ -381,12 +381,23 @@ class ConditionalDenoiser(nn.Module):
         self.hops = tuple(hops)
         self.num_hops = len(self.hops)
 
-        self.time_embedding = nn.Embedding(diffusion_steps, hidden_dim)
-        self.z_proj = nn.Linear(hidden_dim, hidden_dim)
+       self.time_embedding = nn.Embedding(diffusion_steps, hidden_dim)
 
-        self.q_proj = nn.ModuleDict()
-        self.k_proj = nn.ModuleDict()
-        self.v_proj = nn.ModuleDict()
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        
+        self.output_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+
+        
         self.o_proj = nn.ModuleDict()
         self.ffn = nn.ModuleDict()
         self.norm1 = nn.ModuleDict()
@@ -410,54 +421,7 @@ class ConditionalDenoiser(nn.Module):
 
         self.hop_logits = nn.Parameter(torch.zeros(self.num_hops))
 
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """Split embeddings into multi-head format."""
-        num_nodes, _ = x.shape
-        return x.view(num_nodes, self.num_heads, self.head_dim)
-
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """Merge multi-head tensors back to dense embeddings."""
-        num_nodes, num_heads, head_dim = x.shape
-        return x.reshape(num_nodes, num_heads * head_dim)
-
-    def _single_hop_cross_attention(
-        self,
-        z_t: torch.Tensor,
-        cond_h: torch.Tensor,
-        t_emb: torch.Tensor,
-        hop: int,
-    ) -> torch.Tensor:
-        """
-        Apply cross-attention for a single hop condition.
-
-        Args:
-            z_t: noisy latent, shape [N, D]
-            cond_h: hop condition embeddings, shape [N, D]
-            t_emb: timestep embeddings, shape [N, D]
-            hop: hop id
-        Returns:
-            hidden_h: refined embeddings, shape [N, D]
-        """
-        key = str(hop)
-
-        direct = self.z_proj(z_t + t_emb)
-        direct = self.norm1[key](direct)
-
-        q = self._split_heads(self.q_proj[key](cond_h))
-        k = self._split_heads(self.k_proj[key](direct))
-        v = self._split_heads(self.v_proj[key](direct))
-
-        attn_score = (q * k).sum(dim=-1, keepdim=True) / math.sqrt(self.head_dim)
-        attn_weight = torch.softmax(attn_score, dim=1)
-
-        attn_out = attn_weight * v
-        attn_out = self._merge_heads(attn_out)
-        attn_out = self.o_proj[key](attn_out)
-
-        hidden = z_t + attn_out
-        hidden = self.norm2[key](hidden)
-        hidden = hidden + self.ffn[key](torch.cat([hidden, cond_h, t_emb], dim=-1))
-        return hidden
+   
 
     def forward(self, z_t: torch.Tensor, cond_dict: Dict[int, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
         """
@@ -499,12 +463,34 @@ class GatedFusion(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, h_cf: torch.Tensor, h_aux: torch.Tensor) -> torch.Tensor:
-        """Fuse collaborative and auxiliary embeddings."""
-        side = self.dropout(self.side_proj(h_aux))
-        gate = self.gate(torch.cat([h_cf, h_aux], dim=-1))
-        return h_cf + gate * side
+    def forward(
+    self,
+    z_t: torch.Tensor,
+    cond_dict: Dict[int, torch.Tensor],
+    t: torch.Tensor,) -> torch.Tensor:
+    t_emb = self.time_embedding(t)
 
+    # x_t serves as the query: [N, 1, D]
+    query = z_t.unsqueeze(1)
+
+    # Hop-specific conditions serve as keys and values: [N, H, D]
+    condition_tokens = torch.stack(
+        [cond_dict[hop] for hop in self.hops],
+        dim=1,
+    )
+
+    context, _ = self.cross_attention(
+        query,
+        condition_tokens,
+        condition_tokens,
+        need_weights=False,
+    )
+    context = context.squeeze(1)
+
+    # x0-prediction
+    return self.output_mlp(
+        torch.cat([z_t, context, t_emb], dim=-1)
+    )
 
 class Recommender(nn.Module):
     """
