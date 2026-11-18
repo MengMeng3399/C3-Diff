@@ -604,3 +604,5 @@ def compute_loss(pos_score: torch.Tensor, neg_score: torch.Tensor,
     parameter_l2 = sum(p.square().sum() for p in parameters if p.requires_grad)
     ranking_loss = bpr_loss + l2_weight * parameter_l2
     return ranking_loss + loss_reg, ranking_loss
+
+

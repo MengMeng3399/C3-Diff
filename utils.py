@@ -908,3 +908,5 @@ def encode_node_features(data_path: str):
         api_features[idx] = node_feat
 
     return mashup_features, api_features
+
+
