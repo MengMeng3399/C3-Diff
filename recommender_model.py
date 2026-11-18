@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import f1_score, ndcg_score, roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score
 
 
 TensorLike = Union[str, torch.Tensor]
@@ -44,158 +44,83 @@ def compute_f1(pos_score: torch.Tensor, neg_score: torch.Tensor, threshold: floa
     return float(f1_score(labels, preds))
 
 
-def top_k_list(
-    g: dgl.DGLGraph,
-    score: torch.Tensor,
-    n_mashup: int,
-    n_api: int,
-    top_k: int = 10,
-) -> np.ndarray:
-    """
-    Build a dense score matrix and return top-k API indices for each mashup.
+def top_k_list(g, score, n_mashup, n_api, top_k=10, *, train_pos_g):
+    """Rank supplied candidates after masking all training positives.
 
-    The graph is assumed to contain mashup -> API candidate edges.
+    Missing candidates and masked edges never enter top-k, even when fewer
+    than k candidates remain. Ties are broken by API id.
     """
-    top_k = min(top_k, n_api)
-    score_matrix = np.zeros((n_mashup, n_api), dtype=np.float32)
-
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    matrix = np.full((n_mashup, n_api), -np.inf, dtype=np.float64)
     src, dst = g.edges()
-    src = src.detach().cpu().numpy()
-    dst = dst.detach().cpu().numpy()
-    score_np = score.detach().cpu().numpy()
+    values = score.detach().cpu().numpy().reshape(-1)
+    if len(values) != len(src) or not np.isfinite(values).all():
+        raise ValueError("Each candidate must have one finite score")
+    for u, v, value in zip(src.tolist(), dst.tolist(), values):
+        if not (0 <= u < n_mashup <= v < n_mashup + n_api):
+            raise ValueError("Candidates must be Mashup -> API")
+        matrix[u, v - n_mashup] = value
+    train_u, train_v = train_pos_g.edges()
+    for u, v in zip(train_u.tolist(), train_v.tolist()):
+        if not (0 <= u < n_mashup <= v < n_mashup + n_api):
+            raise ValueError("Training positives must be Mashup -> API")
+        matrix[u, v - n_mashup] = -np.inf
+    k = min(top_k, n_api)
+    result = np.full((n_mashup, k), -1, dtype=np.int64)
+    for u in range(n_mashup):
+        available = np.flatnonzero(np.isfinite(matrix[u]))
+        order = np.argsort(-matrix[u, available], kind="stable")[:k]
+        result[u, :len(order)] = available[order]
+    return result
 
-    for i in range(len(src)):
-        mashup_id = int(src[i])
-        api_id = int(dst[i] - n_mashup)
-        if 0 <= mashup_id < n_mashup and 0 <= api_id < n_api:
-            score_matrix[mashup_id, api_id] = score_np[i]
 
-    top_k_index = np.argpartition(score_matrix, -top_k, axis=1)[:, -top_k:]
-    return top_k_index
-
-
-def recall_at_k_user_level(
-    candidate_g: dgl.DGLGraph,
-    pos_g: dgl.DGLGraph,
-    score: torch.Tensor,
-    data_config: Dict[str, int],
-    top_k: int,
-) -> float:
-    """
-    Compute user-level Recall@K.
-
-    For each mashup, recall is:
-        retrieved positive APIs in top-k / all positive APIs
-    The final score is the average over mashups that have at least one positive API.
-    """
-    n_mashup = data_config["n_mashup"]
-    n_api = data_config["n_api"]
-
-    top_k_index = top_k_list(candidate_g, score, n_mashup, n_api, top_k)
-    topk_sets = [set(row.tolist()) for row in top_k_index]
-
+def _ranking_metrics(candidate_g, pos_g, score, data_config, top_k, train_pos_g):
+    n_mashup, n_api = data_config["n_mashup"], data_config["n_api"]
+    ranking = top_k_list(candidate_g, score, n_mashup, n_api, top_k,
+                         train_pos_g=train_pos_g)
+    truth = {}
     src, dst = pos_g.edges()
-    mashup_apis: List[List[int]] = [[] for _ in range(n_mashup)]
-    for s, d in zip(src.tolist(), dst.tolist()):
-        api_id = int(d) - n_mashup
-        if 0 <= api_id < n_api:
-            mashup_apis[int(s)].append(api_id)
-
-    recalls = []
-    for mashup_id in range(n_mashup):
-        true_apis = set(mashup_apis[mashup_id])
-        if not true_apis:
-            continue
-        hit_num = len(topk_sets[mashup_id] & true_apis)
-        recalls.append(hit_num / len(true_apis))
-
-    return float(sum(recalls) / len(recalls)) if recalls else 0.0
-
-
-def compute_recall(
-    candidate_g: dgl.DGLGraph,
-    pos_g: dgl.DGLGraph,
-    score: torch.Tensor,
-    data_config: Dict[str, int],
-    top_k: int,
-) -> float:
-    """
-    Compute pair-level hit ratio at K.
-
-    For each positive pair (mashup, api), count whether the api appears
-    in the top-k predictions of the mashup, then average over all pairs.
-    """
-    n_mashup = data_config["n_mashup"]
-    n_api = data_config["n_api"]
-
-    top_k_index = top_k_list(candidate_g, score, n_mashup, n_api, top_k)
-    topk_sets = [set(row.tolist()) for row in top_k_index]
-
-    src, dst = pos_g.edges()
-    hit = 0
-    total = 0
-
-    for s, d in zip(src.tolist(), dst.tolist()):
-        mashup_id = int(s)
-        api_id = int(d) - n_mashup
-        if 0 <= api_id < n_api:
-            total += 1
-            if api_id in topk_sets[mashup_id]:
-                hit += 1
-
-    return float(hit / total) if total > 0 else 0.0
+    train_src, train_dst = train_pos_g.edges()
+    training = set(zip(train_src.tolist(), train_dst.tolist()))
+    cand_src, cand_dst = candidate_g.edges()
+    candidates = set(zip(cand_src.tolist(), cand_dst.tolist()))
+    for u, v in zip(src.tolist(), dst.tolist()):
+        if (u, v) in training or (u, v) not in candidates:
+            raise ValueError("Evaluation positives must be unseen training edges and present in candidates")
+        truth.setdefault(u, set()).add(v - n_mashup)
+    recalls, ndcgs, hits, positives = [], [], 0, 0
+    for u, relevant in truth.items():
+        relevance = np.array([a in relevant for a in ranking[u]], dtype=float)
+        hit = relevance.sum()
+        discount = 1.0 / np.log2(np.arange(len(relevance)) + 2)
+        ideal = discount[:min(len(relevant), len(discount))].sum()
+        recalls.append(hit / len(relevant))
+        ndcgs.append(float((relevance * discount).sum() / ideal) if ideal else 0.0)
+        hits += hit
+        positives += len(relevant)
+    return (float(np.mean(recalls)) if recalls else 0.0,
+            float(np.mean(ndcgs)) if ndcgs else 0.0,
+            float(hits / positives) if positives else 0.0)
 
 
-def ndcg_at_k(
-    candidate_g: dgl.DGLGraph,
-    pos_g: dgl.DGLGraph,
-    score: torch.Tensor,
-    data_config: Dict[str, int],
-    top_k: int,
-) -> float:
-    """
-    Compute NDCG@K for mashups that appear in the positive test graph.
-    """
-    src_pos, dst_pos = pos_g.edges()
-    unique_mashups = torch.unique(src_pos).tolist()
-    mapped_u = {value: index for index, value in enumerate(unique_mashups)}
-
-    n_eval_mashup = len(unique_mashups)
-    n_mashup = data_config["n_mashup"]
-    n_api = data_config["n_api"]
-
-    label_matrix = np.zeros((n_eval_mashup, n_api), dtype=np.float32)
-    for s, d in zip(src_pos.tolist(), dst_pos.tolist()):
-        label_matrix[mapped_u[int(s)], int(d) - n_mashup] = 1.0
-
-    src_cand, dst_cand = candidate_g.edges()
-    score_matrix = np.zeros((n_eval_mashup, n_api), dtype=np.float32)
-    score_np = score.detach().cpu().numpy()
-    for i, (s, d) in enumerate(zip(src_cand.tolist(), dst_cand.tolist())):
-        if int(s) not in mapped_u:
-            continue
-        api_id = int(d) - n_mashup
-        if 0 <= api_id < n_api:
-            score_matrix[mapped_u[int(s)], api_id] = float(score_np[i])
-
-    return float(ndcg_score(label_matrix, score_matrix, k=min(top_k, n_api)))
+def recall_at_k_user_level(candidate_g, pos_g, score, data_config, top_k, *, train_pos_g):
+    return _ranking_metrics(candidate_g, pos_g, score, data_config, top_k, train_pos_g)[0]
 
 
-def evaluation_metrics(
-    candidate_g: dgl.DGLGraph,
-    pos_g: dgl.DGLGraph,
-    score: torch.Tensor,
-    data_config: Dict[str, int],
-    pos_score: torch.Tensor,
-    neg_score: torch.Tensor,
-    top_k: int,
-) -> Tuple[float, float, float, float]:
-    """Return Recall@K, NDCG@K, F1, and AUC."""
-    recall = recall_at_k_user_level(candidate_g, pos_g, score, data_config, top_k)
-    ndcg = ndcg_at_k(candidate_g, pos_g, score, data_config, top_k)
-    f1 = compute_f1(pos_score, neg_score)
-    auc = compute_auc(pos_score, neg_score)
-    return recall, ndcg, f1, auc
+def compute_recall(candidate_g, pos_g, score, data_config, top_k, *, train_pos_g):
+    """Pair-level recall; uses the same training-positive mask as user-level recall."""
+    return _ranking_metrics(candidate_g, pos_g, score, data_config, top_k, train_pos_g)[2]
+
+
+def ndcg_at_k(candidate_g, pos_g, score, data_config, top_k, *, train_pos_g):
+    return _ranking_metrics(candidate_g, pos_g, score, data_config, top_k, train_pos_g)[1]
+
+
+def evaluation_metrics(candidate_g, pos_g, score, data_config, pos_score, neg_score,
+                       top_k, *, train_pos_g):
+    recall, ndcg, _ = _ranking_metrics(candidate_g, pos_g, score, data_config, top_k, train_pos_g)
+    return recall, ndcg, compute_f1(pos_score, neg_score), compute_auc(pos_score, neg_score)
 
 
 def _load_tensor(x: TensorLike, name: str) -> torch.Tensor:
@@ -318,7 +243,7 @@ class LightGCNEncoder(nn.Module):
         nn.init.xavier_uniform_(self.id_embedding.weight)
 
     def forward(self, g: dgl.DGLGraph) -> torch.Tensor:
-        """Return the averaged node embeddings over all LightGCN layers."""
+        """Sum node representations over layers 0 through L, Eq. (4)."""
         with g.local_scope():
             h0 = self.id_embedding.weight
 
@@ -334,7 +259,6 @@ class LightGCNEncoder(nn.Module):
                 h = g.ndata["h"] * norm
                 out = out + h
 
-            out = out / (self.num_layers + 1.0)
             return out
 
 
@@ -397,11 +321,11 @@ class Recommender(nn.Module):
         self.diffusion_steps = int(n_params.get("diffusion_steps", 5))
         self.dropout = float(n_params.get("dropout", 0.1))
 
-        self.lambda_diff = float(n_params.get("lambda_diff", 1.0))
-        self.lambda_cl = float(n_params.get("lambda_cl", 0.1))
+        self.lambda_diff = float(n_params.get("lambda_diff", 0.1))
+        self.lambda_cl = float(n_params.get("lambda_cl", 0.05))
         self.temperature = float(n_params.get("temperature", 0.2))
 
-        self.hops = tuple(n_params.get("hops", (1, 2, 3)))
+        self.hops = tuple(n_params.get("hops", (1, 2)))
         self.num_hops = len(self.hops)
         if self.num_hops == 0:
             raise ValueError("hops cannot be empty")
@@ -442,6 +366,10 @@ class Recommender(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
 
+        # Separate content encoding c from the latent projection x = W_x c + b_x (Eq. 11).
+        self.mashup_latent_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.api_latent_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+
         guidance_obj = n_params["guidance"]
         mashup_guidance = guidance_obj["mashup_guidance"]
         api_guidance = guidance_obj["api_guidance"]
@@ -463,18 +391,8 @@ class Recommender(nn.Module):
             mashup_dim = _infer_hop_input_dim(True, hop, self.n_mashup, self.n_api)
             api_dim = _infer_hop_input_dim(False, hop, self.n_mashup, self.n_api)
 
-            self.m_cond_encoders[str(hop)] = nn.Sequential(
-                nn.Linear(mashup_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.SiLU(),
-                nn.Dropout(self.dropout),
-            )
-            self.a_cond_encoders[str(hop)] = nn.Sequential(
-                nn.Linear(api_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.SiLU(),
-                nn.Dropout(self.dropout),
-            )
+            self.m_cond_encoders[str(hop)] = nn.Linear(mashup_dim, self.hidden_dim)
+            self.a_cond_encoders[str(hop)] = nn.Linear(api_dim, self.hidden_dim)
 
         # Node-type-specific query/key/value and prediction parameters.
         self.m_denoiser = ConditionalDenoiser(self.hidden_dim, self.diffusion_steps, self.hops, self.dropout)
@@ -494,11 +412,23 @@ class Recommender(nn.Module):
 
         self.m_fusion = GatedFusion(self.hidden_dim)
         self.a_fusion = GatedFusion(self.hidden_dim)
+        self.apply(self._initialize_parameters)
+
+    @staticmethod
+    def _initialize_parameters(module):
+        """Xavier for weight matrices; zero biases and unit normalization scales."""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.xavier_uniform_(module.weight)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
 
     def _get_content_latent(self) -> torch.Tensor:
         """Project raw content features into the auxiliary latent space."""
-        mashup_z0 = self.mashup_content_proj(self.mashup_content_raw)
-        api_z0 = self.api_content_proj(self.api_content_raw)
+        mashup_z0 = self.mashup_latent_proj(self.mashup_content_proj(self.mashup_content_raw))
+        api_z0 = self.api_latent_proj(self.api_content_proj(self.api_content_raw))
         return torch.cat([mashup_z0, api_z0], dim=0)
 
     def _build_condition_dict(self) -> Dict[int, torch.Tensor]:
@@ -604,5 +534,6 @@ def compute_loss(pos_score: torch.Tensor, neg_score: torch.Tensor,
     parameter_l2 = sum(p.square().sum() for p in parameters if p.requires_grad)
     ranking_loss = bpr_loss + l2_weight * parameter_l2
     return ranking_loss + loss_reg, ranking_loss
+
 
 

@@ -1,41 +1,52 @@
 import argparse
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="LLM-HCL")
-    # ===== dataset ===== #
-    parser.add_argument("--dataset", nargs="?", default="data", help="Choose a dataset")
-    parser.add_argument("--data_path", nargs="?", default="data/", help="Input data path.")
+import os
 
 
-    # ===== train ===== #
-    parser.add_argument('--epoch', type=int, default=400, help='number of epochs')
-    parser.add_argument('--batch_size', type=int, default=4096, help='batch size')
-    parser.add_argument('--test_batch_size', type=int, default=2048, help='batch size')
-    parser.add_argument('--dim', type=int, default=64, help='embedding size')
-    parser.add_argument('--l2', type=float, default=1e-5, help='l2 regularization weight')
-    parser.add_argument('--lr', type=float, default=3e-3, help='learning rate')  # default = 1e-4
-    parser.add_argument('--sim_regularity', type=float, default=1e-4, help='regularization weight for latent factor')
-    parser.add_argument("--inverse_r", type=bool, default=True, help="consider inverse relation or not")
-    parser.add_argument("--node_dropout", type=bool, default=True, help="consider node dropout or not")
-    parser.add_argument("--node_dropout_rate", type=float, default=0.5, help="ratio of node dropout")
-    parser.add_argument("--mess_dropout", type=bool, default=True, help="consider message dropout or not")
-    parser.add_argument("--mess_dropout_rate", type=float, default=0.1, help="ratio of node dropout")
-    parser.add_argument("--batch_test_flag", type=bool, default=True, help="use gpu or not")
-    parser.add_argument("--channel", type=int, default=64, help="hidden channels for model")
-    parser.add_argument("--cuda", type=bool, default=True, help="use gpu or not")
-    parser.add_argument("--gpu_id", type=int, default=0, help="gpu id")
-    parser.add_argument('--Ks', nargs='?', default='[5, 10, 20, 50, 100]', help='Output sizes of every layer')
-    parser.add_argument('--test_flag', nargs='?', default='part',
-                        help='Specify the test type from {part, full}, indicating whether the reference is done in mini-batch')
-    parser.add_argument("--ind", type=str, default='mi', help="Independence modeling: mi, distance, cosine")
-
-    # ===== relation context ===== #
-    parser.add_argument('--context_hops', type=int, default=2, help='number of context hops')
-
-    # ===== save model ===== #
-    parser.add_argument("--save", type=bool, default=False, help="save model or not")
-    parser.add_argument("--out_dir", type=str, default="./weights/", help="output directory for model")
-
-    return parser.parse_args()
+# Table 2 and the connectivity-order analysis.
+DATASET_DEFAULTS = {
+    "PWA": {"lr": 1e-3, "l2": 1e-3, "lambda_diff": 0.1, "max_hops": 2},
+    "HGA": {"lr": 3e-4, "l2": 1e-5, "lambda_diff": 0.2, "max_hops": 3},
+}
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="C3-Diff")
+    parser.add_argument("--dataset", choices=("PWA", "HGA"), default="PWA")
+    parser.add_argument("--data_dir", type=str, default=None, help="Directory of processed graph/features.")
+    parser.add_argument("--gpu_id", type=int, default=0, help="GPU id to use when CUDA is available.")
+    parser.add_argument("--cuda", action="store_true", help="Use CUDA if available.")
+    parser.add_argument("--seed", type=int, default=2020, help="Random seed.")
+    parser.add_argument("--batch_size", type=int, default=128, help="Positive interactions per optimizer step.")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
+    parser.add_argument("--eval_every", type=int, default=5, help="Evaluation interval.")
+    parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension.")
+    parser.add_argument("--num_layers", type=int, default=2, help="Number of LightGCN layers.")
+    parser.add_argument("--diffusion_steps", type=int, default=5, help="Number of diffusion steps.")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate.")
+    parser.add_argument("--l2", type=float, default=None, help="L2 regularization weight.")
+    parser.add_argument("--lambda_diff", type=float, default=None, help="Weight of diffusion reconstruction loss.")
+    parser.add_argument("--lambda_cl", type=float, default=0.05, help="Weight of alignment loss.")
+    parser.add_argument("--temperature", type=float, default=0.2, help="Temperature for InfoNCE.")
+    parser.add_argument("--beta_start", type=float, default=1e-4, help="Diffusion beta start.")
+    parser.add_argument("--beta_end", type=float, default=2e-2, help="Diffusion beta end.")
+    parser.add_argument("--top_k", type=int, default=10, help="Top-k for ranking metrics.")
+    parser.add_argument("--save_path", type=str, default="./best_recommender.pt", help="Path to save the best model checkpoint.")
+    parser.add_argument("--max_hops", type=int, choices=(1, 2, 3), default=None)
+    args = parser.parse_args(argv)
+    for name, value in DATASET_DEFAULTS[args.dataset].items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    if args.data_dir is None:
+        args.data_dir = os.path.join("data", args.dataset)
+    args.data_path = args.data_dir
+    if min(args.epochs, args.batch_size, args.eval_every, args.top_k) <= 0:
+        parser.error("epochs, batch_size, eval_every and top_k must be positive")
+
+    if min(args.hidden_dim, args.diffusion_steps, args.lr, args.temperature) <= 0 or args.num_layers < 0:
+        parser.error("Dimensions, steps, learning rate and temperature must be positive")
+    if min(args.l2, args.lambda_diff, args.lambda_cl) < 0 or not 0 <= args.dropout < 1:
+        parser.error("Loss weights must be nonnegative and dropout must be in [0, 1)")
+    if not 0 < args.beta_start <= args.beta_end < 1:
+        parser.error("Require 0 < beta_start <= beta_end < 1")
+    return args

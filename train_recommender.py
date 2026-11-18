@@ -1,10 +1,13 @@
-import argparse
+from parser import parse_args
 import os
 from typing import Dict, Tuple
 
 import dgl
 import torch
 from dgl.data.utils import load_graphs
+from build_guidance_signals import (
+    build_bipartite_adjacency, build_mashup_guidance, build_api_guidance,
+)
 
 from recommender_model import (
     DotProductPredictor,
@@ -34,19 +37,41 @@ def build_candidate_graph(test_pos_g: dgl.DGLGraph, num_mashup: int, num_api: in
 
 
 def load_data(data_dir: str) -> Tuple[Dict, Dict[str, torch.Tensor]]:
-    """Load graphs, content features, and guidance tensors from disk."""
+    """Load fixed, disjoint train/validation/test splits.
+
+    graph.bin retains its existing layout: train_g, train_pos_g, train_neg_g,
+    test_pos_g, test_neg_g, ... . validation.bin must contain exactly
+    [val_pos_g, val_neg_g], using the same global node IDs. All splits must
+    come from the same partition; a legacy train/test split must be rebuilt
+    before adding validation. No test edges are repurposed as validation.
+    """
     graph_path = os.path.join(data_dir, "graph.bin")
     glist, _ = load_graphs(graph_path)
 
-    train_g, train_pos_g, train_neg_g, test_pos_g, test_neg_g, _ = glist[:6]
+    if len(glist) < 5:
+        raise ValueError("graph.bin must contain training and test graphs")
+    _, train_pos_g, train_neg_g, test_pos_g, test_neg_g = glist[:5]
+    validation_path = os.path.join(data_dir, "validation.bin")
+    if not os.path.isfile(validation_path):
+        raise FileNotFoundError("Independent validation.bin is required; do not use test graphs for selection")
+    validation, _ = load_graphs(validation_path)
+    if len(validation) != 2:
+        raise ValueError("validation.bin must contain [val_pos_g, val_neg_g]")
+    val_pos_g, val_neg_g = validation
+    train_g = dgl.to_bidirected(train_pos_g)
 
     mashup_content = torch.load(os.path.join(data_dir, "mashup_em.pt"), map_location="cpu")
     api_content = torch.load(os.path.join(data_dir, "api_em.pt"), map_location="cpu")
-    mashup_guidance = torch.load(os.path.join(data_dir, "mashup_guidance_train.pt"), map_location="cpu")
-    api_guidance = torch.load(os.path.join(data_dir, "api_guidance_train.pt"), map_location="cpu")
-
     num_mashup = len(mashup_content)
     num_api = len(api_content)
+    validate_splits(train_pos_g, val_pos_g, test_pos_g, val_neg_g, test_neg_g,
+                    num_mashup, num_api)
+    # Derive guidance from exactly the same training edges as propagation.
+    u, v = train_pos_g.edges()
+    pairs = [(m, a - num_mashup) for m, a in zip(u.tolist(), v.tolist())]
+    ma, am = build_bipartite_adjacency(pairs, num_mashup, num_api)
+    mashup_guidance = build_mashup_guidance(ma, am, num_mashup)
+    api_guidance = build_api_guidance(ma, am, num_mashup, num_api)
 
     n_params = {
         "n_mashup": num_mashup,
@@ -63,6 +88,8 @@ def load_data(data_dir: str) -> Tuple[Dict, Dict[str, torch.Tensor]]:
         "train_g": train_g,
         "train_pos_g": train_pos_g,
         "train_neg_g": train_neg_g,
+        "val_pos_g": val_pos_g,
+        "val_neg_g": val_neg_g,
         "test_pos_g": test_pos_g,
         "test_neg_g": test_neg_g,
     }
@@ -102,28 +129,53 @@ def sample_bpr_negatives(positive_g, train_g, num_mashup: int, num_api: int):
                      device=positive_src.device)
 
 
+def validate_splits(train, val, test, val_neg, test_neg, n_mashup, n_api):
+    def edges(g):
+        if g.num_nodes() != n_mashup + n_api:
+            raise ValueError("All split graphs must use the full global node space")
+        u, v = g.edges()
+        pairs = list(zip(u.tolist(), v.tolist()))
+        if not pairs or any(not (0 <= m < n_mashup <= a < n_mashup + n_api) for m, a in pairs):
+            raise ValueError("Nonempty Mashup -> API split graphs are required")
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("Split graphs must not contain duplicate edges")
+        return set(pairs)
+    train_edges, val_edges, test_edges = map(edges, (train, val, test))
+    if train_edges & val_edges or train_edges & test_edges or val_edges & test_edges:
+        raise ValueError("Training, validation and test positives must be disjoint")
+    observed = train_edges | val_edges | test_edges
+    if edges(val_neg) & observed or edges(test_neg) & observed:
+        raise ValueError("Evaluation negatives must not be observed positive interactions")
+
+
+def iter_positive_batches(graph, batch_size):
+    """Shuffle positive interactions; retain the final partial batch."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    src, dst = graph.edges()
+    order = torch.randperm(src.numel(), device=src.device)
+    for start in range(0, src.numel(), batch_size):
+        ids = order[start:start + batch_size]
+        yield dgl.graph((src[ids], dst[ids]), num_nodes=graph.num_nodes(), device=src.device)
+
+
+@torch.no_grad()
+def evaluate(model, predictor, train_g, train_pos_g, pos_g, neg_g, n_mashup, n_api, top_k, seed):
+    model.eval()
+    predictor.eval()
+    # Fix the evaluation noise without perturbing the training RNG stream.
+    devices = [next(model.parameters()).device.index] if next(model.parameters()).is_cuda else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        h, _ = model(train_g)
+    candidates = build_candidate_graph(pos_g.to("cpu"), n_mashup, n_api).to(h.device)
+    return evaluation_metrics(candidates, pos_g, predictor(candidates, h),
+        {"n_mashup": n_mashup, "n_api": n_api}, predictor(pos_g, h),
+        predictor(neg_g, h), top_k, train_pos_g=train_pos_g)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the mashup-API recommender.")
-    parser.add_argument("--data_dir", type=str, default="./data/PWA", help="Directory of processed graph/features.")
-    parser.add_argument("--gpu_id", type=int, default=0, help="GPU id to use when CUDA is available.")
-    parser.add_argument("--cuda", action="store_true", help="Use CUDA if available.")
-    parser.add_argument("--seed", type=int, default=2020, help="Random seed.")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
-    parser.add_argument("--eval_every", type=int, default=5, help="Evaluation interval.")
-    parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension.")
-    parser.add_argument("--num_layers", type=int, default=2, help="Number of LightGCN layers.")
-    parser.add_argument("--diffusion_steps", type=int, default=10, help="Number of diffusion steps.")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--l2", type=float, default=1e-4, help="L2 regularization weight.")
-    parser.add_argument("--lambda_diff", type=float, default=1.0, help="Weight of diffusion reconstruction loss.")
-    parser.add_argument("--lambda_cl", type=float, default=0.1, help="Weight of alignment loss.")
-    parser.add_argument("--temperature", type=float, default=0.2, help="Temperature for InfoNCE.")
-    parser.add_argument("--beta_start", type=float, default=1e-4, help="Diffusion beta start.")
-    parser.add_argument("--beta_end", type=float, default=2e-2, help="Diffusion beta end.")
-    parser.add_argument("--top_k", type=int, default=10, help="Top-k for ranking metrics.")
-    parser.add_argument("--save_path", type=str, default="./best_recommender.pt", help="Path to save the best model checkpoint.")
-    args = parser.parse_args()
+    args = parse_args()
 
     set_seed(args.seed)
 
@@ -139,6 +191,7 @@ def main() -> None:
     n_params.update(
         {
             "hidden_dim": args.hidden_dim,
+            "hops": tuple(range(1, args.max_hops + 1)),
             "num_layers": args.num_layers,
             "diffusion_steps": args.diffusion_steps,
             "dropout": args.dropout,
@@ -160,99 +213,54 @@ def main() -> None:
 
     train_g = move_graph_to_device(graphs["train_g"], device)
     train_pos_g = move_graph_to_device(graphs["train_pos_g"], device)
-    train_neg_g = move_graph_to_device(graphs["train_neg_g"], device)
-    test_pos_g = move_graph_to_device(graphs["test_pos_g"], device)
-    test_neg_g = move_graph_to_device(graphs["test_neg_g"], device)
-
-    candidate_g = build_candidate_graph(graphs["test_pos_g"], num_mashup, num_api).to(device)
-
+    val_pos_g = move_graph_to_device(graphs["val_pos_g"], device)
+    val_neg_g = move_graph_to_device(graphs["val_neg_g"], device)
     best_recall = -1.0
-    best_metrics = None
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         predictor.train()
-
-        h, loss_reg = model(train_g)
-        pos_score = predictor(train_pos_g, h)
-        negative_g = sample_bpr_negatives(train_pos_g, train_g, num_mashup, num_api)
-        neg_score = predictor(negative_g, h)
-
-        loss, ranking_loss_only = compute_loss(
-            pos_score=pos_score,
-            neg_score=neg_score,
-            loss_reg=loss_reg,
-            parameters=model.parameters(),
-            l2_weight=args.l2,
-        )
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        epoch_loss, steps = 0.0, 0
+        for batch_pos_g in iter_positive_batches(train_pos_g, args.batch_size):
+            # Refresh the full graph representation at each optimizer step;
+            # recommendation triplets are minibatched, not graph neighborhoods.
+            h, loss_reg = model(train_g)
+            negative_g = sample_bpr_negatives(batch_pos_g, train_g, num_mashup, num_api)
+            loss, _ = compute_loss(predictor(batch_pos_g, h), predictor(negative_g, h),
+                                   loss_reg, model.parameters(), args.l2)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            steps += 1
 
         if epoch % args.eval_every == 0 or epoch == 1 or epoch == args.epochs:
-            model.eval()
-            predictor.eval()
-
-            with torch.no_grad():
-                h_eval, _ = model(train_g)
-                candidate_score = predictor(candidate_g, h_eval)
-                test_pos_score = predictor(test_pos_g, h_eval)
-                test_neg_score = predictor(test_neg_g, h_eval)
-
-                recall, ndcg, f1, auc = evaluation_metrics(
-                    candidate_g=candidate_g,
-                    pos_g=test_pos_g,
-                    score=candidate_score,
-                    data_config={"n_mashup": num_mashup, "n_api": num_api},
-                    pos_score=test_pos_score,
-                    neg_score=test_neg_score,
-                    top_k=args.top_k,
-                )
-
-            print(
-                f"Epoch {epoch:03d} | "
-                f"train_loss={loss.item():.4f} | "
-                f"rank_loss={ranking_loss_only.item():.4f} | "
-                f"Recall@{args.top_k}={recall:.4f} | "
-                f"NDCG@{args.top_k}={ndcg:.4f} | "
-                f"F1={f1:.4f} | "
-                f"AUC={auc:.4f}"
-            )
-
+            metrics = evaluate(model, predictor, train_g, train_pos_g, val_pos_g, val_neg_g,
+                               num_mashup, num_api, args.top_k, args.seed)
+            recall, ndcg, f1, auc = metrics
+            print(f"Epoch {epoch:03d} | train_loss={epoch_loss / max(steps, 1):.4f} | "
+                  f"validation Recall@{args.top_k}={recall:.4f} | NDCG={ndcg:.4f} | "
+                  f"F1={f1:.4f} | AUC={auc:.4f}")
             if recall > best_recall:
                 best_recall = recall
-                best_metrics = {
-                    "epoch": epoch,
-                    "recall": recall,
-                    "ndcg": ndcg,
-                    "f1": f1,
-                    "auc": auc,
-                }
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "predictor_state_dict": predictor.state_dict(),
-                        "args": vars(args),
-                        "best_metrics": best_metrics,
-                    },
-                    args.save_path,
-                )
+                torch.save({"model_state_dict": model.state_dict(), "args": vars(args),
+                            "selection_split": "validation", "epoch": epoch,
+                            "validation_metrics": metrics}, args.save_path)
 
-    if best_metrics is not None:
-        print("\nBest checkpoint summary:")
-        print(
-            f"Epoch {best_metrics['epoch']} | "
-            f"Recall@{args.top_k}={best_metrics['recall']:.4f} | "
-            f"NDCG@{args.top_k}={best_metrics['ndcg']:.4f} | "
-            f"F1={best_metrics['f1']:.4f} | "
-            f"AUC={best_metrics['auc']:.4f}"
-        )
-        print(f"Checkpoint saved to: {args.save_path}")
+    # Restore the validation-selected checkpoint before the sole test evaluation.
+    checkpoint = torch.load(args.save_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    test_metrics = evaluate(model, predictor, train_g, train_pos_g,
+                            graphs["test_pos_g"].to(device), graphs["test_neg_g"].to(device),
+                            num_mashup, num_api, args.top_k, args.seed)
+    print(f"Selected epoch {checkpoint['epoch']} using validation Recall; "
+          f"test Recall@{args.top_k}={test_metrics[0]:.4f} | "
+          f"NDCG={test_metrics[1]:.4f} | F1={test_metrics[2]:.4f} | AUC={test_metrics[3]:.4f}")
 
 
 if __name__ == "__main__":
     main()
+
 
 
 

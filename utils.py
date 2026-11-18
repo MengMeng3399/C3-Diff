@@ -239,9 +239,9 @@ def build_subgraphs_from_train_test(
     Returns
     -------
     train_g : dgl.DGLGraph
-        Graph containing only training positive edges.
+        Bidirectional propagation graph built only from training positive edges.
     train_pos_g : dgl.DGLGraph
-        Same as train_g, kept for clarity.
+        Directed Mashup -> API edges used by the recommendation loss.
     train_neg_g : dgl.DGLGraph
         Graph containing negative edges for training.
     test_pos_g : dgl.DGLGraph
@@ -276,7 +276,8 @@ def build_subgraphs_from_train_test(
     train_pos_g = dgl.graph((train_pos_u, train_pos_v), num_nodes=all_nodes)
     test_pos_g = dgl.graph((test_pos_u, test_pos_v), num_nodes=all_nodes)
 
-    train_g = train_pos_g
+    # Only the propagation graph is bidirectional; BPR positives stay directed.
+    train_g = dgl.to_bidirected(train_pos_g)
 
     # Negative sampling
     if invoke_df is not None:
@@ -908,5 +909,6 @@ def encode_node_features(data_path: str):
         api_features[idx] = node_feat
 
     return mashup_features, api_features
+
 
 
