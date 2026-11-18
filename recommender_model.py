@@ -176,7 +176,7 @@ def ndcg_at_k(
             continue
         api_id = int(d) - n_mashup
         if 0 <= api_id < n_api:
-            score_matrix[mapped_u[int(s)], api_id] = max(float(score_np[i]), 0.0)
+            score_matrix[mapped_u[int(s)], api_id] = float(score_np[i])
 
     return float(ndcg_score(label_matrix, score_matrix, k=min(top_k, n_api)))
 
@@ -284,41 +284,25 @@ def _infer_hop_input_dim(is_mashup_side: bool, hop: int, n_mashup: int, n_api: i
 
 
 def info_nce_loss(x: torch.Tensor, y: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
-    """Compute a symmetric InfoNCE loss between two embedding sets."""
+    """Eq. (19): CF anchors, cross-view positives, both-view negatives."""
+    if x.shape != y.shape or temperature <= 0:
+        raise ValueError("Views must have matching shapes and temperature must be positive")
     if x.size(0) == 0:
-        return x.new_tensor(0.0)
-
-    x = F.normalize(x, dim=-1)
-    y = F.normalize(y, dim=-1)
-
-    logits = torch.matmul(x, y.t()) / temperature
-    labels = torch.arange(x.size(0), device=x.device)
-
-    loss_xy = F.cross_entropy(logits, labels)
-    loss_yx = F.cross_entropy(logits.t(), labels)
-    return 0.5 * (loss_xy + loss_yx)
+        return x.sum() * 0.0
+    x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
+    cross = x @ y.t() / temperature
+    same = x @ x.t() / temperature
+    same = same.masked_fill(torch.eye(x.size(0), device=x.device, dtype=torch.bool), -torch.inf)
+    denominator = torch.logsumexp(torch.cat([cross, same], dim=1), dim=1)
+    return (denominator - cross.diagonal()).mean()
 
 
-class MLPPredictor(nn.Module):
-    """Edge scorer that predicts mashup-API matching logits from node embeddings."""
-
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 1)
-
-    def apply_edges(self, edges):
-        """Produce a scalar score for each edge."""
-        edge_input = torch.cat([edges.src["h"], edges.dst["h"]], dim=1)
-        score = self.fc2(F.relu(self.fc1(edge_input))).squeeze(1)
-        return {"score": score}
+class DotProductPredictor(nn.Module):
+    """Inner-product edge scores, Eq. (22)."""
 
     def forward(self, g: dgl.DGLGraph, h: torch.Tensor) -> torch.Tensor:
-        """Apply the predictor on all edges of the graph."""
-        with g.local_scope():
-            g.ndata["h"] = h
-            g.apply_edges(self.apply_edges)
-            return g.edata["score"]
+        src, dst = g.edges()
+        return (h[src] * h[dst]).sum(dim=-1)
 
 
 class LightGCNEncoder(nn.Module):
@@ -355,142 +339,42 @@ class LightGCNEncoder(nn.Module):
 
 
 class ConditionalDenoiser(nn.Module):
-    """
-    Conditional denoiser with multi-hop guidance.
+    """Cross-attention over connectivity orders and x0 prediction, Eqs. (14)-(15)."""
 
-    The model combines noisy latent states with hop-wise condition features,
-    and aggregates hop outputs with learnable hop weights.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        diffusion_steps: int,
-        hops: Tuple[int, ...] = (1, 2, 3),
-        dropout: float = 0.1,
-    ):
+    def __init__(self, hidden_dim: int, diffusion_steps: int,
+                 hops: Tuple[int, ...] = (1, 2, 3), dropout: float = 0.1):
         super().__init__()
-        if hidden_dim % num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by num_heads")
-
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.diffusion_steps = diffusion_steps
         self.hops = tuple(hops)
-        self.num_hops = len(self.hops)
-
-       self.time_embedding = nn.Embedding(diffusion_steps, hidden_dim)
-
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        
+        self.time_embedding = nn.Embedding(diffusion_steps, hidden_dim)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.output_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim * 2),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 3, hidden_dim * 2), nn.SiLU(),
+            nn.Dropout(dropout), nn.Linear(hidden_dim * 2, hidden_dim),
         )
 
-        
-        self.o_proj = nn.ModuleDict()
-        self.ffn = nn.ModuleDict()
-        self.norm1 = nn.ModuleDict()
-        self.norm2 = nn.ModuleDict()
-
-        for hop in self.hops:
-            key = str(hop)
-            self.q_proj[key] = nn.Linear(hidden_dim, hidden_dim)
-            self.k_proj[key] = nn.Linear(hidden_dim, hidden_dim)
-            self.v_proj[key] = nn.Linear(hidden_dim, hidden_dim)
-            self.o_proj[key] = nn.Linear(hidden_dim, hidden_dim)
-            self.norm1[key] = nn.LayerNorm(hidden_dim)
-            self.norm2[key] = nn.LayerNorm(hidden_dim)
-            self.ffn[key] = nn.Sequential(
-                nn.Linear(hidden_dim * 3, hidden_dim * 2),
-                nn.SiLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.Dropout(dropout),
-            )
-
-        self.hop_logits = nn.Parameter(torch.zeros(self.num_hops))
-
-   
-
-    def forward(self, z_t: torch.Tensor, cond_dict: Dict[int, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
-        """
-        Predict the clean latent representation from noisy input.
-
-        Args:
-            z_t: noisy latent, shape [N, D]
-            cond_dict: per-hop condition embeddings
-            t: diffusion step per node, shape [N]
-        Returns:
-            Predicted clean latent x0, shape [N, D]
-        """
-        t_emb = self.time_embedding(t)
-        alpha = torch.softmax(self.hop_logits, dim=0)
-
-        hop_outputs = []
-        for idx, hop in enumerate(self.hops):
-            cond_h = cond_dict[hop]
-            hidden_h = self._single_hop_cross_attention(z_t, cond_h, t_emb, hop)
-            hop_outputs.append(alpha[idx] * hidden_h)
-
-        return torch.stack(hop_outputs, dim=0).sum(dim=0)
+    def forward(self, z_t: torch.Tensor, cond_dict: Dict[int, torch.Tensor],
+                t: torch.Tensor) -> torch.Tensor:
+        tokens = torch.stack([cond_dict[hop] for hop in self.hops], dim=1)
+        query = self.q_proj(z_t).unsqueeze(1)
+        keys, values = self.k_proj(tokens), self.v_proj(tokens)
+        weights = torch.softmax((query * keys).sum(-1) / math.sqrt(z_t.size(-1)), dim=1)
+        context = (weights.unsqueeze(-1) * values).sum(dim=1)
+        return self.output_mlp(torch.cat([z_t, context, self.time_embedding(t)], dim=-1))
 
 
 class GatedFusion(nn.Module):
-    """
-    CF-dominant gated residual fusion.
+    """CF base plus gated calibrated content, Eq. (21)."""
 
-    The collaborative representation is the backbone, and the denoised
-    auxiliary representation is injected as a gated residual.
-    """
-
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+    def __init__(self, hidden_dim: int):
         super().__init__()
-        self.side_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Sigmoid(),
-        )
-        self.dropout = nn.Dropout(dropout)
+        self.gate = nn.Linear(hidden_dim * 2, hidden_dim)
 
-    def forward(
-    self,
-    z_t: torch.Tensor,
-    cond_dict: Dict[int, torch.Tensor],
-    t: torch.Tensor,) -> torch.Tensor:
-    t_emb = self.time_embedding(t)
+    def forward(self, h_cf: torch.Tensor, h_aux: torch.Tensor) -> torch.Tensor:
+        gamma = torch.sigmoid(self.gate(torch.cat([h_cf, h_aux], dim=-1)))
+        return h_cf + gamma * h_aux
 
-    # x_t serves as the query: [N, 1, D]
-    query = z_t.unsqueeze(1)
-
-    # Hop-specific conditions serve as keys and values: [N, H, D]
-    condition_tokens = torch.stack(
-        [cond_dict[hop] for hop in self.hops],
-        dim=1,
-    )
-
-    context, _ = self.cross_attention(
-        query,
-        condition_tokens,
-        condition_tokens,
-        need_weights=False,
-    )
-    context = context.squeeze(1)
-
-    # x0-prediction
-    return self.output_mlp(
-        torch.cat([z_t, context, t_emb], dim=-1)
-    )
 
 class Recommender(nn.Module):
     """
@@ -510,7 +394,6 @@ class Recommender(nn.Module):
 
         self.hidden_dim = int(n_params.get("hidden_dim", 64))
         self.num_layers = int(n_params.get("num_layers", 2))
-        self.num_heads = int(n_params.get("num_heads", 4))
         self.diffusion_steps = int(n_params.get("diffusion_steps", 5))
         self.dropout = float(n_params.get("dropout", 0.1))
 
@@ -593,16 +476,14 @@ class Recommender(nn.Module):
                 nn.Dropout(self.dropout),
             )
 
-        self.denoiser = ConditionalDenoiser(
-            hidden_dim=self.hidden_dim,
-            num_heads=self.num_heads,
-            diffusion_steps=self.diffusion_steps,
-            hops=self.hops,
-            dropout=self.dropout,
-        )
+        # Node-type-specific query/key/value and prediction parameters.
+        self.m_denoiser = ConditionalDenoiser(self.hidden_dim, self.diffusion_steps, self.hops, self.dropout)
+        self.a_denoiser = ConditionalDenoiser(self.hidden_dim, self.diffusion_steps, self.hops, self.dropout)
 
         beta_start = float(n_params.get("beta_start", 1e-4))
         beta_end = float(n_params.get("beta_end", 2e-2))
+        if self.diffusion_steps < 1 or not (0 < beta_start <= beta_end < 1):
+            raise ValueError("Require T >= 1 and 0 < beta_start <= beta_end < 1")
         betas = torch.linspace(beta_start, beta_end, self.diffusion_steps)
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
@@ -611,7 +492,8 @@ class Recommender(nn.Module):
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bars", alpha_bars)
 
-        self.fusion = GatedFusion(hidden_dim=self.hidden_dim, dropout=self.dropout)
+        self.m_fusion = GatedFusion(self.hidden_dim)
+        self.a_fusion = GatedFusion(self.hidden_dim)
 
     def _get_content_latent(self) -> torch.Tensor:
         """Project raw content features into the auxiliary latent space."""
@@ -645,28 +527,37 @@ class Recommender(nn.Module):
         x_t = alpha_bar_t.sqrt() * x0 + (1.0 - alpha_bar_t).sqrt() * noise
         return x_t, alpha_bar_t
 
-    def _diffusion_forward(self, x0: torch.Tensor, cond_dict: Dict[int, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run one diffusion training step for all nodes.
+    def _denoise(self, x_t: torch.Tensor, cond_dict: Dict[int, torch.Tensor],
+                 t: torch.Tensor) -> torch.Tensor:
+        split = self.n_mashup
+        return torch.cat([
+            self.m_denoiser(x_t[:split], {h: c[:split] for h, c in cond_dict.items()}, t[:split]),
+            self.a_denoiser(x_t[split:], {h: c[split:] for h, c in cond_dict.items()}, t[split:]),
+        ], dim=0)
 
-        The denoiser predicts x0 directly instead of predicting noise.
-        """
-        device = x0.device
-        num_nodes = x0.size(0)
+    def _diffusion_forward(self, x0: torch.Tensor, cond_dict: Dict[int, torch.Tensor]) -> torch.Tensor:
+        """Uniform single-step x0 prediction for Eq. (23) only; indices are t-1."""
+        t = torch.randint(self.diffusion_steps, (x0.size(0),), device=x0.device)
+        x_t, _ = self._q_sample(x0, t, torch.randn_like(x0))
+        error = (self._denoise(x_t, cond_dict, t) - x0).square().sum(dim=-1)
+        return error[:self.n_mashup].mean() + error[self.n_mashup:].mean()
 
-        t = torch.randint(
-            low=0,
-            high=self.diffusion_steps,
-            size=(num_nodes,),
-            device=device,
-        )
-        noise = torch.randn_like(x0)
-
-        x_t, _ = self._q_sample(x0, t, noise)
-        x0_hat = self.denoiser(x_t, cond_dict, t)
-        diff_loss = F.mse_loss(x0_hat, x0)
-
-        return x0_hat, diff_loss
+    def _reverse_diffusion(self, x0: torch.Tensor, cond_dict: Dict[int, torch.Tensor],
+                           noise: torch.Tensor = None) -> torch.Tensor:
+        """Eqs. (13), (17)-(18): q(x_T|x0), then T reverse means without added noise."""
+        t = torch.full((x0.size(0),), self.diffusion_steps - 1, device=x0.device, dtype=torch.long)
+        x_t, _ = self._q_sample(x0, t, torch.randn_like(x0) if noise is None else noise)
+        for step in range(self.diffusion_steps - 1, -1, -1):
+            t = torch.full_like(t, step)
+            prediction = self._denoise(x_t, cond_dict, t)
+            if step == 0:  # alpha_bar_0 = 1: the last mean is the x0 prediction.
+                x_t = prediction
+            else:
+                previous = self.alpha_bars[step - 1]
+                denominator = 1.0 - self.alpha_bars[step]
+                x_t = (self.alphas[step].sqrt() * (1.0 - previous) * x_t
+                       + previous.sqrt() * self.betas[step] * prediction) / denominator
+        return x_t
 
     def _alignment_loss(self, h_cf: torch.Tensor, h_aux: torch.Tensor) -> torch.Tensor:
         """Align CF embeddings with denoised auxiliary embeddings by node type."""
@@ -678,7 +569,7 @@ class Recommender(nn.Module):
 
         loss_m = info_nce_loss(mashup_cf, mashup_aux, self.temperature)
         loss_a = info_nce_loss(api_cf, api_aux, self.temperature)
-        return 0.5 * (loss_m + loss_a)
+        return loss_m + loss_a
 
     def forward(self, train_g: dgl.DGLGraph) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -689,42 +580,27 @@ class Recommender(nn.Module):
         h_cf = self.cf_encoder(train_g)
         x0 = self._get_content_latent()
         cond_dict = self._build_condition_dict()
-        h_aux, diff_loss = self._diffusion_forward(x0, cond_dict)
-        h_fused = self.fusion(h_cf, h_aux)
-        cl_loss = self._alignment_loss(h_cf, h_aux)
-        loss_reg = self.lambda_diff * diff_loss + self.lambda_cl * cl_loss
+        h_aux = self._reverse_diffusion(x0, cond_dict)
+        split = self.n_mashup
+        h_fused = torch.cat([
+            self.m_fusion(h_cf[:split], h_aux[:split]),
+            self.a_fusion(h_cf[split:], h_aux[split:]),
+        ], dim=0)
+        loss_reg = x0.new_zeros(())
+        if self.training:
+            diff_loss = self._diffusion_forward(x0, cond_dict)
+            cl_loss = self._alignment_loss(h_cf, h_aux)
+            loss_reg = self.lambda_diff * diff_loss + self.lambda_cl * cl_loss
         return h_fused, loss_reg
 
 
-def compute_loss(
-    pos_score: torch.Tensor,
-    neg_score: torch.Tensor,
-    loss_reg: torch.Tensor,
-    h: torch.Tensor,
-    n_mashup: int,
-    data_args,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute the total training loss.
-
-    Returns:
-        total_loss: BCE + regularization losses
-        ranking_loss_only: BCE + embedding L2
-    """
-    scores = torch.cat([pos_score, neg_score], dim=0)
-    labels = torch.cat(
-        [torch.ones_like(pos_score), torch.zeros_like(neg_score)],
-        dim=0,
-    )
-
-    decay = data_args.l2
-    bce_loss = nn.BCEWithLogitsLoss()(scores, labels)
-
-    mashup_emb = h[:n_mashup, :]
-    api_emb = h[n_mashup:, :]
-    regularizer = (torch.norm(mashup_emb) ** 2 + torch.norm(api_emb) ** 2) / 2.0
-    emb_loss = decay * regularizer / max(n_mashup, 1)
-
-    total_loss = bce_loss + 0.1 * loss_reg + emb_loss
-    ranking_loss_only = bce_loss + emb_loss
-    return total_loss, ranking_loss_only
+def compute_loss(pos_score: torch.Tensor, neg_score: torch.Tensor,
+                 loss_reg: torch.Tensor, parameters, l2_weight: float = 1e-4
+                 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Eqs. (24)-(25); score pairs must represent (m, positive API, negative API)."""
+    if pos_score.shape != neg_score.shape or pos_score.numel() == 0:
+        raise ValueError("BPR requires nonempty, aligned positive/negative scores")
+    bpr_loss = -F.logsigmoid(pos_score - neg_score).sum()
+    parameter_l2 = sum(p.square().sum() for p in parameters if p.requires_grad)
+    ranking_loss = bpr_loss + l2_weight * parameter_l2
+    return ranking_loss + loss_reg, ranking_loss

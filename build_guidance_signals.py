@@ -10,7 +10,7 @@ from dgl.data.utils import load_graphs
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build CF-Diff style 1/2/3-hop guidance signals from a homogeneous DGL train graph."
+        description="Build C3-Diff 1/2/3-hop guidance signals from a homogeneous DGL train graph."
     )
     parser.add_argument(
         "--graph-path",
@@ -172,120 +172,49 @@ def build_bipartite_adjacency(
 
     return mashup_to_api, api_to_mashup
 
-# 从当前这一层节点出发，统计下一层每个邻居被连到了多少次。
-def expand_counter(
-    frontier_nodes: List[int],
-    adjacency: List[set],
-) -> Counter:
+def expand_counter(frontier: Counter, adjacency: List[set]) -> Counter:
+    """Propagate every prefix-walk count to each adjacent node."""
+    result = Counter()
+    for node_id, count in frontier.items():
+        for neighbor in adjacency[node_id]:
+            result[neighbor] += count
+    return result
+
+
+def walk_counters(target: int, first_adjacency: List[set], second_adjacency: List[set]):
+    """Length-1/2/3 walks without revisiting the target, Eqs. (8)-(10).
+
+    A third-hop endpoint may also be a first-hop neighbor. Intermediate
+    nodes other than the target may be revisited; this is not shortest distance.
     """
-    Count how many incoming links each next-hop node receives
-    from the previous-hop frontier.
-
-    count = number of incoming links from previous-hop neighbors.
-    """
-    counter = Counter()
-    for node_id in frontier_nodes:
-        for nb in adjacency[node_id]:
-            counter[nb] += 1
-    return counter
+    hop1 = Counter({node: 1 for node in first_adjacency[target]})
+    hop2 = expand_counter(hop1, second_adjacency)
+    hop2.pop(target, None)
+    hop3 = expand_counter(hop2, first_adjacency)
+    return hop1, hop2, hop3
 
 
-def build_mashup_guidance(
-    mashup_to_api: List[set],
-    api_to_mashup: List[set],
-    num_mashups: int,
-):
-    """
-    For each mashup m (local id):
-      hop1 -> api local ids
-      hop2 -> mashup local ids
-      hop3 -> api local ids
-
-    Exact-hop rules:
-      - hop1: direct APIs, binary edges => count=1
-      - hop2: exclude self mashup
-      - hop3: exclude APIs already in hop1
-    """
-    all_guidance = []
-
+def build_mashup_guidance(mashup_to_api: List[set], api_to_mashup: List[set], num_mashups: int):
+    guidance = []
     for m in range(num_mashups):
-        # hop1: direct api neighbors, binary edge => count = 1
-        hop1_counter = Counter({a: 1 for a in mashup_to_api[m]})
-        hop1_set = set(hop1_counter.keys())
-
-        # hop2: other mashups reached from hop1 apis
-        hop2_counter = expand_counter(list(hop1_set), api_to_mashup)
-        hop2_counter.pop(m, None)  # remove self
-        hop2_set = set(hop2_counter.keys())
-
-        # hop3: apis reached from hop2 mashups
-        hop3_counter = expand_counter(list(hop2_set), mashup_to_api)
-        for a in hop1_set:
-            hop3_counter.pop(a, None)  # exact 3-hop only
-        hop3_set = set(hop3_counter.keys())
-
-        # pack
-        item = {
-            "node_type": "mashup",
-            "node_local_id": m,
-            "node_global_id": m,
-            "hop1": pack_hop(hop1_counter, node_type="api", num_mashups=num_mashups),
-            "hop2": pack_hop(hop2_counter, node_type="mashup", num_mashups=num_mashups),
-            "hop3": pack_hop(hop3_counter, node_type="api", num_mashups=num_mashups),
-        }
-        all_guidance.append(item)
-
-    return all_guidance
+        counters = walk_counters(m, mashup_to_api, api_to_mashup)
+        item = {"node_type": "mashup", "node_local_id": m, "node_global_id": m}
+        for hop, counter in enumerate(counters, 1):
+            item[f"hop{hop}"] = pack_hop(counter, "api" if hop % 2 else "mashup", num_mashups)
+        guidance.append(item)
+    return guidance
 
 
-def build_api_guidance(
-    mashup_to_api: List[set],
-    api_to_mashup: List[set],
-    num_mashups: int,
-    num_apis: int,
-):
-    """
-    For each api a (local id):
-      hop1 -> mashup local ids
-      hop2 -> api local ids
-      hop3 -> mashup local ids
-
-    Exact-hop rules:
-      - hop1: direct mashups, binary edge => count=1
-      - hop2: exclude self api
-      - hop3: exclude mashups already in hop1
-    """
-    all_guidance = []
-
+def build_api_guidance(mashup_to_api: List[set], api_to_mashup: List[set],
+                       num_mashups: int, num_apis: int):
+    guidance = []
     for a in range(num_apis):
-        api_global_id = num_mashups + a
-
-        # hop1: direct mashup neighbors, binary edge => count = 1
-        hop1_counter = Counter({m: 1 for m in api_to_mashup[a]})
-        hop1_set = set(hop1_counter.keys())
-
-        # hop2: other apis reached from hop1 mashups
-        hop2_counter = expand_counter(list(hop1_set), mashup_to_api)
-        hop2_counter.pop(a, None)  # remove self
-        hop2_set = set(hop2_counter.keys())
-
-        # hop3: mashups reached from hop2 apis
-        hop3_counter = expand_counter(list(hop2_set), api_to_mashup)
-        for m in hop1_set:
-            hop3_counter.pop(m, None)  # exact 3-hop only
-        hop3_set = set(hop3_counter.keys())
-
-        item = {
-            "node_type": "api",
-            "node_local_id": a,
-            "node_global_id": api_global_id,
-            "hop1": pack_hop(hop1_counter, node_type="mashup", num_mashups=num_mashups),
-            "hop2": pack_hop(hop2_counter, node_type="api", num_mashups=num_mashups),
-            "hop3": pack_hop(hop3_counter, node_type="mashup", num_mashups=num_mashups),
-        }
-        all_guidance.append(item)
-
-    return all_guidance
+        counters = walk_counters(a, api_to_mashup, mashup_to_api)
+        item = {"node_type": "api", "node_local_id": a, "node_global_id": num_mashups + a}
+        for hop, counter in enumerate(counters, 1):
+            item[f"hop{hop}"] = pack_hop(counter, "mashup" if hop % 2 else "api", num_mashups)
+        guidance.append(item)
+    return guidance
 
 
 def summarize_guidance(guidance: List[Dict], prefix: str) -> Dict[str, float]:
@@ -438,8 +367,8 @@ def main():
             "mashup_global_ids": [0, num_mashups - 1],
             "api_global_ids": [num_mashups, num_nodes - 1],
         },
-        "signal_style": "CF-Diff style",
-        "hop_definition": "exact_hop",
+        "signal_style": "C3-Diff",
+        "hop_definition": "target_avoiding_length_h_walks",
     }
     torch.save(combined, out_dir / "guidance_signals_train.pt")
 
@@ -467,12 +396,12 @@ def main():
             "mashup_global_ids": [0, num_mashups - 1],
             "api_global_ids": [num_mashups, num_nodes - 1],
         },
-        "signal_style": "CF-Diff style",
-        "hop_definition": "exact_hop",
+        "signal_style": "C3-Diff",
+        "hop_definition": "target_avoiding_length_h_walks",
         "count_definition": {
             "hop1": "binary direct neighbors, count=1",
-            "hop2": "number of incoming links from hop1 frontier",
-            "hop3": "number of incoming links from hop2 frontier",
+            "hop2": "length-2 walk counts excluding return to target",
+            "hop3": "length-3 walk counts propagated from hop2 counts",
         },
         "weight_definition": "weights = counts / sum(counts) within each hop",
         "notes": [
@@ -481,7 +410,7 @@ def main():
             "Node ids are continuous global ids",
             "Sparse files save both local_ids and global_ids",
             "hop2 excludes self node",
-            "hop3 excludes nodes already appearing in hop1",
+            "hop3 retains hop1 neighbors reachable by valid length-3 walks",
         ],
     }
     meta.update(summarize_guidance(mashup_guidance, "mashup"))

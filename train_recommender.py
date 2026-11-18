@@ -7,7 +7,7 @@ import torch
 from dgl.data.utils import load_graphs
 
 from recommender_model import (
-    MLPPredictor,
+    DotProductPredictor,
     Recommender,
     compute_auc,
     compute_f1,
@@ -74,6 +74,34 @@ def move_graph_to_device(g: dgl.DGLGraph, device: torch.device) -> dgl.DGLGraph:
     return g.to(device)
 
 
+def sample_bpr_negatives(positive_g, train_g, num_mashup: int, num_api: int):
+    """Sample an unobserved API for each positive edge, preserving its Mashup and order."""
+    positive_src, positive_dst = positive_g.edges()
+    observed = [set() for _ in range(num_mashup)]
+    src, dst = train_g.edges()
+    for u, v in zip(src.tolist(), dst.tolist()):
+        if 0 <= u < num_mashup <= v < num_mashup + num_api:
+            observed[u].add(v - num_mashup)
+        elif 0 <= v < num_mashup <= u < num_mashup + num_api:
+            observed[v].add(u - num_mashup)
+    sources = positive_src.tolist()
+    for u, v in zip(sources, positive_dst.tolist()):
+        if not (0 <= u < num_mashup <= v < num_mashup + num_api):
+            raise ValueError("Positive edges must be Mashup -> API")
+        observed[u].add(v - num_mashup)
+    negatives = torch.empty_like(positive_dst)
+    for u in sorted(set(sources)):
+        available = sorted(set(range(num_api)) - observed[u])
+        if not available:
+            raise ValueError(f"Mashup {u} has no unobserved API for BPR")
+        choices = torch.tensor(available, device=positive_src.device)
+        positions = (positive_src == u).nonzero(as_tuple=True)[0]
+        draws = torch.randint(len(available), (positions.numel(),), device=positive_src.device)
+        negatives[positions] = choices[draws] + num_mashup
+    return dgl.graph((positive_src, negatives), num_nodes=num_mashup + num_api,
+                     device=positive_src.device)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the mashup-API recommender.")
     parser.add_argument("--data_dir", type=str, default="./data/PWA", help="Directory of processed graph/features.")
@@ -84,7 +112,6 @@ def main() -> None:
     parser.add_argument("--eval_every", type=int, default=5, help="Evaluation interval.")
     parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension.")
     parser.add_argument("--num_layers", type=int, default=2, help="Number of LightGCN layers.")
-    parser.add_argument("--num_heads", type=int, default=4, help="Number of attention heads in denoiser.")
     parser.add_argument("--diffusion_steps", type=int, default=10, help="Number of diffusion steps.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
@@ -113,7 +140,6 @@ def main() -> None:
         {
             "hidden_dim": args.hidden_dim,
             "num_layers": args.num_layers,
-            "num_heads": args.num_heads,
             "diffusion_steps": args.diffusion_steps,
             "dropout": args.dropout,
             "lambda_diff": args.lambda_diff,
@@ -125,7 +151,7 @@ def main() -> None:
     )
 
     model = Recommender(n_params).to(device)
-    predictor = MLPPredictor(args.hidden_dim).to(device)
+    predictor = DotProductPredictor().to(device)
 
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(predictor.parameters()),
@@ -149,16 +175,15 @@ def main() -> None:
 
         h, loss_reg = model(train_g)
         pos_score = predictor(train_pos_g, h)
-        neg_score = predictor(train_neg_g, h)
+        negative_g = sample_bpr_negatives(train_pos_g, train_g, num_mashup, num_api)
+        neg_score = predictor(negative_g, h)
 
         loss, ranking_loss_only = compute_loss(
             pos_score=pos_score,
             neg_score=neg_score,
             loss_reg=loss_reg,
-            h=h,
-            n_mashup=num_mashup,
+            parameters=model.parameters(),
             l2_weight=args.l2,
-            reg_weight=0.1,
         )
 
         optimizer.zero_grad()
@@ -228,3 +253,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
