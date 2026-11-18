@@ -1,5 +1,4 @@
 # Calibrating content via high-order connectivity-guided diffusion for cloud API recommendation
-Research source code for C3-Diff. Processed graphs, content tensors, experiment splits, checkpoints, and a packaged execution environment are not bundled in this repository.
 
 ⭐ Overall framework of the C3-Diff model⭐ 
 
